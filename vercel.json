@@ -6,8 +6,8 @@
       "framework": "express",
       "entrypoint": "index.ts",
       "functions": {
-        "**": {
-          "includeFiles": "{config,data,i18n,views,ftp,encryptionkeys,uploads,frontend/dist,.well-known}/**"
+        "index.ts": {
+          "includeFiles": "{swagger.yml,ctf.key,config/**,data/**,i18n/**,views/**,ftp/**,encryptionkeys/**,.well-known/**,infrastructure/**,frontend/dist/**,node_modules/sqlite3/**,node_modules/bindings/**,node_modules/file-uri-to-path/**}"
         }
       }
     }

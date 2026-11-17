@@ -165,7 +165,9 @@ const collectDurationPromise = (name: string, func: (...args: any) => Promise<an
 /* Sets view engine to hbs */
 app.set('view engine', 'hbs')
 
-void collectDurationPromise('validatePreconditions', validatePreconditions)()
+if (!process.env.VERCEL) { // serverless: no port, no source files and no node_modules next to the working directory to validate
+  void collectDurationPromise('validatePreconditions', validatePreconditions)()
+}
 void collectDurationPromise('cleanupFtpFolder', cleanupFtpFolder)()
 void collectDurationPromise('validateConfig', validateConfig)({})
 
