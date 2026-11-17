@@ -4,6 +4,7 @@
     "app": {
       "root": ".",
       "framework": "express",
+      "entrypoint": "index.ts",
       "functions": {
         "**": {
           "includeFiles": "{config,data,i18n,views,ftp,encryptionkeys,uploads,frontend/dist,.well-known}/**"
