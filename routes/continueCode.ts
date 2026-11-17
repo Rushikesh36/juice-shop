@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import Hashids from 'hashids/cjs'
+import Hashids from 'hashids'
 import { type Request, type Response } from 'express'
 import { ChallengeModel } from '../models/challenge'
 import { challenges } from '../data/datacache'
