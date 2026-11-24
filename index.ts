@@ -37,6 +37,9 @@ async function bootstrap () {
 }
 
 const ready = bootstrap()
+// a failed bootstrap is reported to each request via next(err) below; without this
+// the rejection is unhandled until the first request arrives and Node kills the process
+ready.catch(() => {})
 
 const app = express()
 app.use((req, res, next) => {
