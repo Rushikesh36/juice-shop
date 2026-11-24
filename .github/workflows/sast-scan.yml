@@ -9,7 +9,7 @@
 #   SECURITY_HUB_USERNAME   a user made with `npm run add-user` (role "ci" fits a pipeline)
 #   SECURITY_HUB_PASSWORD   that user's password
 #
-# Run it: Actions tab, "SAST scan", Run workflow.
+# It runs on every push (commit or merge) to master, and by hand: Actions tab, "SAST scan", Run workflow.
 name: SAST scan
 
 on:
@@ -23,6 +23,8 @@ on:
         description: "Fail this job when the scan reports a new HIGH finding"
         type: boolean
         default: true
+  push:
+    branches: [master]
   # To also scan every pull request, remove the comment marks from the next two lines.
   # pull_request:
   #   branches: [master]
