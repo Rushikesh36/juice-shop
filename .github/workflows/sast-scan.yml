@@ -1,0 +1,157 @@
+# Runs a Security Hub SAST (Semgrep) scan on this repository, from GitHub Actions.
+#
+# It calls the deployed API the same way the dashboard does: log in, create a scan, upload a zip of
+# this repo to the pre-signed S3 URL, start the scan, then poll until it finishes. The job fails if
+# the scan fails, and (by default) if the scan reports a new HIGH finding.
+#
+# Setup, once: add these repository secrets (Settings, Secrets and variables, Actions).
+#   SECURITY_HUB_API_URL    the api_base_url output, for example https://abc123.execute-api.us-east-1.amazonaws.com
+#   SECURITY_HUB_USERNAME   a user made with `npm run add-user` (role "ci" fits a pipeline)
+#   SECURITY_HUB_PASSWORD   that user's password
+#
+# Run it: Actions tab, "SAST scan", Run workflow.
+name: SAST scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: "Project ID in the Security Hub (3 to 50 characters: lowercase letters, digits, hyphens, starting with a letter). Empty uses the repository name."
+        required: false
+        default: ""
+      fail_on_new_high:
+        description: "Fail this job when the scan reports a new HIGH finding"
+        type: boolean
+        default: true
+  # To also scan every pull request, remove the comment marks from the next two lines.
+  # pull_request:
+  #   branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  sast:
+    name: SAST scan through the Security Hub
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Scan
+        env:
+          API_URL: ${{ secrets.SECURITY_HUB_API_URL }}
+          HUB_USERNAME: ${{ secrets.SECURITY_HUB_USERNAME }}
+          HUB_PASSWORD: ${{ secrets.SECURITY_HUB_PASSWORD }}
+          INPUT_PROJECT_ID: ${{ inputs.project_id }}
+          FAIL_ON_NEW_HIGH: ${{ inputs.fail_on_new_high }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for name in API_URL HUB_USERNAME HUB_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::The secret for $name is not set. See the comment at the top of this workflow."
+              exit 1
+            fi
+          done
+          API_URL="${API_URL%/}"
+          # The input only exists for a manual run. Any other trigger fails the job on a new HIGH finding.
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then FAIL_ON_NEW_HIGH=true; fi
+
+          # Project ID: the input, or the repository name made to fit the rule.
+          PROJECT_ID="${INPUT_PROJECT_ID:-}"
+          if [ -z "$PROJECT_ID" ]; then
+            PROJECT_ID="$(echo "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
+          fi
+          if ! [[ "$PROJECT_ID" =~ ^[a-z][a-z0-9-]{2,49}$ ]]; then
+            echo "::error::Project ID '$PROJECT_ID' is not valid. Use 3 to 50 lowercase letters, digits or hyphens, starting with a letter."
+            exit 1
+          fi
+          echo "Project: $PROJECT_ID"
+
+          # Zip the code without the folders that are large or not source. The API accepts up to 50 MB.
+          ZIP="$RUNNER_TEMP/code.zip"
+          zip -r -q "$ZIP" . -x ".git/*" "node_modules/*" "build/*" "dist/*" ".next/*" "out/*" "coverage/*" ".terraform/*" "*.tfstate" "*.tfstate.*"
+          BYTES="$(stat -c%s "$ZIP")"
+          echo "Zip size: $BYTES bytes"
+          if [ "$BYTES" -gt $((50 * 1024 * 1024)) ]; then
+            echo "::error::The zip is larger than the 50 MB limit. Add large folders to the exclude list in this step."
+            exit 1
+          fi
+
+          # Log in. The token is masked in the logs and passed to curl through a file, not the command line.
+          LOGIN="$(jq -n --arg u "$HUB_USERNAME" --arg p "$HUB_PASSWORD" '{username: $u, password: $p}' \
+            | curl -fsS -X POST "$API_URL/login" -H 'Content-Type: application/json' --data-binary @-)"
+          TOKEN="$(echo "$LOGIN" | jq -r '.token')"
+          echo "::add-mask::$TOKEN"
+          AUTH="$RUNNER_TEMP/auth-header"
+          (umask 077; printf 'Authorization: Bearer %s\n' "$TOKEN" > "$AUTH")
+          echo "Logged in."
+
+          # Create the scan. The response has the pre-signed upload URL and the headers it needs.
+          CREATED="$(jq -n --arg p "$PROJECT_ID" '{projectId: $p, scanType: "SAST"}' \
+            | curl -fsS -X POST "$API_URL/scans" -H "@$AUTH" -H 'Content-Type: application/json' --data-binary @-)"
+          JOB_ID="$(echo "$CREATED" | jq -r '.jobId')"
+          UPLOAD_URL="$(echo "$CREATED" | jq -r '.upload.url')"
+          echo "::add-mask::$UPLOAD_URL"
+          echo "Scan created: $JOB_ID"
+
+          # Upload straight to S3 with exactly the returned headers and no Authorization header.
+          HEADERS="$RUNNER_TEMP/upload-headers"
+          echo "$CREATED" | jq -r '.upload.headers | to_entries[] | "\(.key): \(.value)"' > "$HEADERS"
+          curl -fsS -X PUT "$UPLOAD_URL" -H "@$HEADERS" --data-binary "@$ZIP" -o /dev/null
+          echo "Zip uploaded."
+
+          # Start the scan.
+          curl -fsS -X POST "$API_URL/scans/$JOB_ID/start" -H "@$AUTH" -o /dev/null
+          echo "Scan started."
+
+          # Poll until it finishes. The reaper fails a scan after 25 minutes, so 30 minutes is the limit here.
+          STATUS=""
+          for _ in $(seq 1 180); do
+            SCAN="$(curl -fsS "$API_URL/scans/$JOB_ID" -H "@$AUTH")"
+            NEW_STATUS="$(echo "$SCAN" | jq -r '.status')"
+            if [ "$NEW_STATUS" != "$STATUS" ]; then
+              STATUS="$NEW_STATUS"
+              echo "$(date -u +%H:%M:%S) status: $STATUS"
+            fi
+            if [ "$STATUS" = "COMPLETED" ] || [ "$STATUS" = "FAILED" ]; then break; fi
+            sleep 10
+          done
+
+          if [ "$STATUS" = "FAILED" ]; then
+            echo "::error::The scan failed: $(echo "$SCAN" | jq -r '.error // "no message"')"
+            exit 1
+          fi
+          if [ "$STATUS" != "COMPLETED" ]; then
+            echo "::error::The scan did not finish in 30 minutes (last status: $STATUS)."
+            exit 1
+          fi
+
+          # Results.
+          NEW="$(echo "$SCAN" | jq -r '.summary.new')"
+          NEW_HIGH="$(echo "$SCAN" | jq -r '.summary.newHigh')"
+          STILL_OPEN="$(echo "$SCAN" | jq -r '.summary.stillOpen')"
+          FIXED="$(echo "$SCAN" | jq -r '.summary.fixed')"
+          {
+            echo "## SAST scan: \`$PROJECT_ID\`"
+            echo
+            echo "Job \`$JOB_ID\`, status **COMPLETED**"
+            echo
+            echo "| New | New HIGH | Still open | Fixed |"
+            echo "| --- | --- | --- | --- |"
+            echo "| $NEW | $NEW_HIGH | $STILL_OPEN | $FIXED |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Result: new=$NEW newHigh=$NEW_HIGH stillOpen=$STILL_OPEN fixed=$FIXED"
+
+          if [ "$NEW_HIGH" -gt 0 ]; then
+            echo "New HIGH findings:"
+            curl -fsS "$API_URL/projects/$PROJECT_ID/findings?scanType=SAST" -H "@$AUTH" \
+              | jq -r --arg job "$JOB_ID" '.items[] | select((.severity | ascii_upcase) == "HIGH" and .firstSeenJobId == $job) | "- \(.ruleId): \(.location | tostring)"'
+            if [ "$FAIL_ON_NEW_HIGH" = "true" ]; then
+              echo "::error::The scan found $NEW_HIGH new HIGH finding(s)."
+              exit 1
+            fi
+          fi
