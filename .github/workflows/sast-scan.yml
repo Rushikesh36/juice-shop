@@ -25,7 +25,7 @@ on:
         default: true
   # To also scan every pull request, remove the comment marks from the next two lines.
   # pull_request:
-  #   branches: [main]
+  #   branches: [master]
 
 permissions:
   contents: read
